@@ -7,10 +7,31 @@
 - 井点与样本：登记井点坐标、含水层、采样批次和实验室测量结果。
 - 同位素计算：处理稳定同位素、溶质浓度、检测限和质量守恒约束，反演多个补给端元比例。
 - 污染迁移：计算一维平流、弥散和一阶衰减，提供到达时间和浓度曲线。
+- 参数集版本：场地参数（孔隙率、流速、弥散、衰减、端元组成）按 `site_code + code` 分组版本化，经历草稿、复核、发布、撤销四个阶段；发布后内容不可变。
 - 任务与审计：保存参数版本、计算输入摘要、置信区间、失败重试和结果差异。
 - 身份与权限：用户、角色、细粒度权限、会话令牌、账号停用和会话撤销。
 - 审计记录：关键身份操作留痕，并对口令和令牌等敏感字段做过滤。
 - 后台任务：使用 SQLite 保存待执行任务，支持去重、租约、重试和完成回执。
+
+## 参数集生命周期
+
+同一场地的孔隙率、流速和端元组成会随着新调查资料修订。参数集把一次修订固化为不可变版本，完整流程为：
+
+```text
+draft --submit--> in_review/pending --approve--> in_review/approved --publish--> published --retract--> retracted
+                     └----reject----> draft/rejected（修改后可重新提交）
+```
+
+- 草稿可编辑；提交复核后内容冻结，发布时校验内容摘要（`content_digest`）防止篡改。
+- 提交人与复核人不能是同一人；发布与撤销需要 `hydro.params.publish` 权限。
+- 所有反演与迁移任务必须引用**已发布**的参数集版本（`parameter_set_id`），任务入队时把参数与端元快照整体写入 `input_json`，重跑历史任务永远使用当时的参数。
+- 发布新版本只把引用旧版本的结果标记为 `stale`（`stale_reason` / `stale_since`），绝不改写历史 `result_json`；撤销已发布版本同理。
+- 发布需携带 `expected_base_version_id`：若该分组已被并发发布了更新的版本，返回 409，可 `rebase` 到最新版本后重新走复核流程。
+- `POST /api/hydro/param-sets/{id}/recompute` 按最新发布版本批量重算受影响结果：旧任务保留并挂上 `superseded_by_task_id`，新任务记录 `recompute_of_task_id`，重算幂等可重复执行。
+- 前后差异：`GET /api/hydro/param-sets/diff?old=&new=` 给出参数与端元级差异；`GET /api/hydro/results/diff?task_type=&old=&new=` 给出反演比例、RMSE、峰值浓度、到达时间等结果级差异；`GET /api/hydro/param-sets/{id}/affected` 列出被标记的结果。
+- 每次状态变更写入 `audit_events`（`hydro.params.*`）并记录复核轨迹；越权访问记录 `hydro.access.denied`（outcome=denied）。
+
+新增权限：`hydro.read`、`hydro.write`、`hydro.params.write`、`hydro.params.review`、`hydro.params.publish`、`hydro.recompute`，管理员角色自动获得。
 
 ## 运行环境
 
@@ -85,7 +106,7 @@ app/
   core/            时钟、安全、异常和分页能力
   repositories/    SQLite 查询与持久化读取
   routers/         灾情、事件、公告、部门和信访业务接口
-  hydro/            地下水、同位素反演和污染迁移服务
+  hydro/           地下水、同位素反演、污染迁移与参数集版本服务
   schemas/         管理接口输入模型
   services/        身份、审计和后台任务领域服务
   cli.py           初始化、检查和冒烟入口

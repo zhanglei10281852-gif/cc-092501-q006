@@ -233,6 +233,12 @@ PERMISSIONS = [
     ("announcements.write", "维护公告", "announcements", "write"),
     ("audit.read", "查看审计", "audit", "read"),
     ("jobs.run", "执行后台任务", "jobs", "run"),
+    ("hydro.read", "查看地下水计算数据", "hydro", "read"),
+    ("hydro.write", "维护井点样本与提交计算", "hydro", "write"),
+    ("hydro.params.write", "编辑参数集草稿", "hydro", "params.write"),
+    ("hydro.params.review", "复核参数集", "hydro", "params.review"),
+    ("hydro.params.publish", "发布与撤销参数集", "hydro", "params.publish"),
+    ("hydro.recompute", "批量重算地下水结果", "hydro", "recompute"),
 ]
 
 

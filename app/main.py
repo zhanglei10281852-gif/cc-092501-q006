@@ -13,6 +13,8 @@ from app.seismic.router import router as seismic_router
 from app.seismic.service import ensure_schema as ensure_seismic_schema
 from app.food.router import router as food_router
 from app.food.service import ensure_schema as ensure_food_schema
+from app.hydro.router import param_router as hydro_param_router
+from app.hydro.router import result_router as hydro_result_router
 from app.hydro.router import router as hydro_router
 from app.hydro.service import ensure_schema as ensure_hydro_schema
 
@@ -57,6 +59,8 @@ app.include_router(petitions.router)
 app.include_router(seismic_router)
 app.include_router(food_router)
 app.include_router(hydro_router)
+app.include_router(hydro_param_router)
+app.include_router(hydro_result_router)
 
 
 @app.get("/")

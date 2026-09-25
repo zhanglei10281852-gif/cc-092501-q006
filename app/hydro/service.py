@@ -7,6 +7,7 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
+from app.core.errors import NotFoundError, ValidationError
 from app.database import get_connection, transaction
 
 
@@ -33,12 +34,51 @@ CREATE TABLE IF NOT EXISTS hydro_inversions (
  task_key TEXT NOT NULL UNIQUE, model_version TEXT NOT NULL, method TEXT NOT NULL,
  input_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued', attempts INTEGER NOT NULL DEFAULT 0,
  worker_id TEXT NOT NULL DEFAULT '', result_json TEXT NOT NULL DEFAULT '{}', error TEXT NOT NULL DEFAULT '',
+ parameter_set_id INTEGER, parameter_set_version INTEGER,
+ stale INTEGER NOT NULL DEFAULT 0, stale_reason TEXT NOT NULL DEFAULT '', stale_since TEXT,
+ superseded_by_task_id INTEGER, recompute_of_task_id INTEGER,
  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS hydro_transport_runs (
  id INTEGER PRIMARY KEY AUTOINCREMENT, well_id INTEGER NOT NULL REFERENCES hydro_wells(id) ON DELETE RESTRICT,
  task_key TEXT NOT NULL UNIQUE, model_version TEXT NOT NULL, input_json TEXT NOT NULL,
- status TEXT NOT NULL DEFAULT 'queued', result_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+ status TEXT NOT NULL DEFAULT 'queued', result_json TEXT NOT NULL DEFAULT '{}',
+ parameter_set_id INTEGER, parameter_set_version INTEGER,
+ stale INTEGER NOT NULL DEFAULT 0, stale_reason TEXT NOT NULL DEFAULT '', stale_since TEXT,
+ superseded_by_task_id INTEGER, recompute_of_task_id INTEGER,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS hydro_param_sets (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ site_code TEXT NOT NULL, code TEXT NOT NULL, version INTEGER NOT NULL,
+ status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','in_review','published','retracted')),
+ review_state TEXT NOT NULL DEFAULT 'none' CHECK(review_state IN ('none','pending','approved','rejected')),
+ porosity REAL NOT NULL, velocity_m_day REAL NOT NULL, dispersion_m2_day REAL NOT NULL,
+ decay_per_day REAL NOT NULL DEFAULT 0, notes TEXT NOT NULL DEFAULT '',
+ content_digest TEXT NOT NULL,
+ base_version_id INTEGER REFERENCES hydro_param_sets(id),
+ supersedes_version_id INTEGER REFERENCES hydro_param_sets(id),
+ created_by TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ submitted_by TEXT, submitted_at TEXT,
+ reviewed_by TEXT, reviewed_at TEXT, review_comment TEXT,
+ published_by TEXT, published_at TEXT,
+ retracted_by TEXT, retracted_at TEXT, retract_reason TEXT,
+ UNIQUE(site_code,code,version)
+);
+CREATE TABLE IF NOT EXISTS hydro_param_set_endmembers (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ param_set_id INTEGER NOT NULL REFERENCES hydro_param_sets(id) ON DELETE CASCADE,
+ name TEXT NOT NULL, isotope_d18o REAL NOT NULL, isotope_d2h REAL NOT NULL,
+ solute_mg_l REAL NOT NULL, uncertainty REAL NOT NULL,
+ source_endmember_id INTEGER, position INTEGER NOT NULL,
+ UNIQUE(param_set_id,name)
+);
+CREATE TABLE IF NOT EXISTS hydro_param_set_reviews (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ param_set_id INTEGER NOT NULL REFERENCES hydro_param_sets(id) ON DELETE CASCADE,
+ action TEXT NOT NULL CHECK(action IN ('create','update','submit','approve','reject','rebase','publish','retract')),
+ actor TEXT NOT NULL, comment TEXT NOT NULL DEFAULT '',
+ from_status TEXT NOT NULL, to_status TEXT NOT NULL, created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS hydro_audit (
  id INTEGER PRIMARY KEY AUTOINCREMENT, resource_type TEXT NOT NULL, resource_id INTEGER,
@@ -46,15 +86,56 @@ CREATE TABLE IF NOT EXISTS hydro_audit (
 );
 CREATE INDEX IF NOT EXISTS idx_hydro_samples_well ON hydro_samples(well_id,sampled_at);
 CREATE INDEX IF NOT EXISTS idx_hydro_inversions_status ON hydro_inversions(status,created_at);
+CREATE INDEX IF NOT EXISTS idx_hydro_param_sets_group ON hydro_param_sets(site_code,code,status,version);
+CREATE INDEX IF NOT EXISTS idx_hydro_param_set_endmembers_set ON hydro_param_set_endmembers(param_set_id,position);
 """
+
+# 旧库缺列时按定义补齐，保证已部署的数据库可以就地升级
+TASK_TABLE_COLUMNS: dict[str, dict[str, str]] = {
+    "hydro_inversions": {
+        "parameter_set_id": "parameter_set_id INTEGER",
+        "parameter_set_version": "parameter_set_version INTEGER",
+        "stale": "stale INTEGER NOT NULL DEFAULT 0",
+        "stale_reason": "stale_reason TEXT NOT NULL DEFAULT ''",
+        "stale_since": "stale_since TEXT",
+        "superseded_by_task_id": "superseded_by_task_id INTEGER",
+        "recompute_of_task_id": "recompute_of_task_id INTEGER",
+    },
+    "hydro_transport_runs": {
+        "parameter_set_id": "parameter_set_id INTEGER",
+        "parameter_set_version": "parameter_set_version INTEGER",
+        "stale": "stale INTEGER NOT NULL DEFAULT 0",
+        "stale_reason": "stale_reason TEXT NOT NULL DEFAULT ''",
+        "stale_since": "stale_since TEXT",
+        "superseded_by_task_id": "superseded_by_task_id INTEGER",
+        "recompute_of_task_id": "recompute_of_task_id INTEGER",
+    },
+}
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    existing = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+
+
 def ensure_schema() -> None:
-    get_connection().executescript(SCHEMA)
+    connection = get_connection()
+    connection.executescript(SCHEMA)
+    for table, columns in TASK_TABLE_COLUMNS.items():
+        for column, definition in columns.items():
+            _ensure_column(connection, table, column, definition)
+    # 依赖补齐列的索引必须在 ALTER TABLE 之后创建，否则旧库迁移会失败
+    connection.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_hydro_inversions_stale ON hydro_inversions(stale,parameter_set_id);
+        CREATE INDEX IF NOT EXISTS idx_hydro_transport_stale ON hydro_transport_runs(stale,parameter_set_id);
+        """
+    )
 
 
 def _digest(value: Any) -> str:
@@ -63,6 +144,70 @@ def _digest(value: Any) -> str:
 
 def _dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(row) if row else None
+
+
+def param_set_snapshot(connection: sqlite3.Connection, param_set_id: int, *, require_published: bool = True) -> dict[str, Any]:
+    """读取参数集及其端元快照；任务引用时强制要求已发布的不可变版本。"""
+    row = connection.execute("SELECT * FROM hydro_param_sets WHERE id=?", (param_set_id,)).fetchone()
+    if row is None:
+        raise NotFoundError("参数集不存在")
+    if require_published and row["status"] != "published":
+        raise ValidationError("反演与迁移任务必须引用已发布的参数集版本")
+    endmembers = connection.execute(
+        "SELECT * FROM hydro_param_set_endmembers WHERE param_set_id=? ORDER BY position,id", (param_set_id,)
+    ).fetchall()
+    return {
+        "id": row["id"],
+        "site_code": row["site_code"],
+        "code": row["code"],
+        "version": row["version"],
+        "content_digest": row["content_digest"],
+        "porosity": row["porosity"],
+        "velocity_m_day": row["velocity_m_day"],
+        "dispersion_m2_day": row["dispersion_m2_day"],
+        "decay_per_day": row["decay_per_day"],
+        "endmembers": [dict(item) for item in endmembers],
+    }
+
+
+def build_transport_input(payload: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
+    """迁移任务的水动力参数一律取自参数集快照，请求体不再接受流速等字段。"""
+    return {
+        "parameter_set_id": snapshot["id"],
+        "source_concentration": payload["source_concentration"],
+        "distance_m": payload["distance_m"],
+        "duration_days": payload["duration_days"],
+        "step_days": payload["step_days"],
+        "model_version": payload["model_version"],
+        "velocity_m_day": snapshot["velocity_m_day"],
+        "dispersion_m2_day": snapshot["dispersion_m2_day"],
+        "decay_per_day": snapshot["decay_per_day"],
+        "parameter_set": snapshot,
+    }
+
+
+def compute_transport_result(effective: dict[str, Any]) -> dict[str, Any]:
+    points=[]; t=effective["step_days"]
+    while t<=effective["duration_days"]+1e-12:
+        d=effective["dispersion_m2_day"]; x=effective["distance_m"]; v=effective["velocity_m_day"]
+        c=effective["source_concentration"]*math.exp(-((x-v*t)**2)/(4*d*t))*math.exp(-effective["decay_per_day"]*t)/math.sqrt(4*math.pi*d*t)
+        points.append({"time_days":round(t,8),"concentration":c}); t+=effective["step_days"]
+    peak=max(points,key=lambda p:p["concentration"])
+    return {"points":points,"peak":peak,"arrival_time_days":effective["distance_m"]/effective["velocity_m_day"],"model_version":effective["model_version"]}
+
+
+def insert_transport_run(connection: sqlite3.Connection, well_id: int, effective: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """按任务键去重并写入迁移结果；返回 (任务行, 是否新建)。调用方负责事务。"""
+    key=_digest({"well_id":well_id,**effective})
+    old=connection.execute("SELECT * FROM hydro_transport_runs WHERE task_key=?",(key,)).fetchone()
+    if old: return dict(old), False
+    result=compute_transport_result(effective)
+    now=_now()
+    snapshot=effective["parameter_set"]
+    cursor=connection.execute(
+        "INSERT INTO hydro_transport_runs(well_id,task_key,model_version,input_json,status,result_json,parameter_set_id,parameter_set_version,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (well_id,key,effective["model_version"],json.dumps(effective,ensure_ascii=False),"done",json.dumps(result,ensure_ascii=False),snapshot["id"],snapshot["version"],now,now))
+    return dict(connection.execute("SELECT * FROM hydro_transport_runs WHERE id=?",(cursor.lastrowid,)).fetchone()), True
 
 
 class HydroService:
@@ -111,7 +256,7 @@ class HydroService:
         total=sum(clipped)
         return [1/len(values)]*len(values) if total<=1e-15 else [v/total for v in clipped]
 
-    def solve_mixture(self, sample: sqlite3.Row, endmembers: list[sqlite3.Row], max_iterations: int, tolerance: float) -> dict[str, Any]:
+    def solve_mixture(self, sample: sqlite3.Row | dict[str, Any], endmembers: list[dict[str, Any]], max_iterations: int, tolerance: float) -> dict[str, Any]:
         observed=[sample["isotope_d18o"],sample["isotope_d2h"],sample["solute_mg_l"]]
         active=[i for i,v in enumerate(observed) if v is not None]
         if len(active)<2: raise ValueError("insufficient_measurements")
@@ -137,15 +282,18 @@ class HydroService:
     def enqueue_inversion(self, sample_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         sample=self.connection.execute("SELECT * FROM hydro_samples WHERE id=?",(sample_id,)).fetchone()
         if sample is None: raise KeyError("sample_not_found")
-        ids=sorted(set(payload["endmember_ids"]))
-        endmembers=self.connection.execute(f"SELECT * FROM hydro_endmembers WHERE active=1 AND id IN ({','.join('?' for _ in ids)}) ORDER BY id",ids).fetchall()
-        if len(endmembers)!=len(ids): raise ValueError("endmember_not_found")
-        input_data={**payload,"endmember_ids":ids,"sample":dict(sample),"endmembers":[dict(e) for e in endmembers]}
+        snapshot=param_set_snapshot(self.connection, payload["parameter_set_id"])
+        endmembers=snapshot["endmembers"]
+        if len(endmembers)<2: raise ValueError("insufficient_endmembers")
+        input_data={key:payload[key] for key in ("method","max_iterations","tolerance","model_version")}
+        input_data.update({"parameter_set":snapshot,"sample":dict(sample),"endmembers":endmembers})
         key=_digest(input_data); now=_now()
         with transaction(immediate=True) as connection:
             old=connection.execute("SELECT * FROM hydro_inversions WHERE task_key=?",(key,)).fetchone()
             if old: return dict(old)
-            cursor=connection.execute("INSERT INTO hydro_inversions(sample_id,task_key,model_version,method,input_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",(sample_id,key,payload["model_version"],payload["method"],json.dumps(input_data,ensure_ascii=False),now,now))
+            cursor=connection.execute(
+                "INSERT INTO hydro_inversions(sample_id,task_key,model_version,method,input_json,parameter_set_id,parameter_set_version,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (sample_id,key,payload["model_version"],payload["method"],json.dumps(input_data,ensure_ascii=False),snapshot["id"],snapshot["version"],now,now))
             return dict(connection.execute("SELECT * FROM hydro_inversions WHERE id=?",(cursor.lastrowid,)).fetchone())
 
     def run_inversion(self, task_id: int, worker_id: str) -> dict[str, Any]:
@@ -155,9 +303,9 @@ class HydroService:
             if task["status"]=="done": return dict(task)
             connection.execute("UPDATE hydro_inversions SET status='running',attempts=attempts+1,worker_id=?,updated_at=? WHERE id=?",(worker_id,_now(),task_id))
         data=json.loads(task["input_json"])
-        sample=self.connection.execute("SELECT * FROM hydro_samples WHERE id=?",(task["sample_id"],)).fetchone()
-        ids=data["endmember_ids"]
-        endmembers=self.connection.execute(f"SELECT * FROM hydro_endmembers WHERE id IN ({','.join('?' for _ in ids)}) ORDER BY id",ids).fetchall()
+        # 端元与样本一律取任务入队时冻结的快照，重跑历史任务不受后续参数修订影响
+        sample=data["sample"]
+        endmembers=data["endmembers"]
         try: result=self.solve_mixture(sample,endmembers,data["max_iterations"],data["tolerance"])
         except Exception as exc:
             with transaction(immediate=True) as connection: connection.execute("UPDATE hydro_inversions SET status='failed',error=?,updated_at=? WHERE id=?",(str(exc),_now(),task_id))
@@ -166,18 +314,18 @@ class HydroService:
             connection.execute("UPDATE hydro_inversions SET status='done',result_json=?,error='',updated_at=? WHERE id=?",(json.dumps(result,ensure_ascii=False),_now(),task_id))
             return dict(connection.execute("SELECT * FROM hydro_inversions WHERE id=?",(task_id,)).fetchone())
 
+    def get_inversion(self, task_id: int) -> dict[str, Any] | None:
+        row=self.connection.execute("SELECT * FROM hydro_inversions WHERE id=?",(task_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_transport_run(self, task_id: int) -> dict[str, Any] | None:
+        row=self.connection.execute("SELECT * FROM hydro_transport_runs WHERE id=?",(task_id,)).fetchone()
+        return dict(row) if row else None
+
     def run_transport(self, well_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         if self.connection.execute("SELECT id FROM hydro_wells WHERE id=?",(well_id,)).fetchone() is None: raise KeyError("well_not_found")
-        key=_digest({"well_id":well_id,**payload}); now=_now()
-        old=self.connection.execute("SELECT * FROM hydro_transport_runs WHERE task_key=?",(key,)).fetchone()
-        if old: return dict(old)
-        points=[]; t=payload["step_days"]
-        while t<=payload["duration_days"]+1e-12:
-            d=payload["dispersion_m2_day"]; x=payload["distance_m"]; v=payload["velocity_m_day"]
-            c=payload["source_concentration"]*math.exp(-((x-v*t)**2)/(4*d*t))*math.exp(-payload["decay_per_day"]*t)/math.sqrt(4*math.pi*d*t)
-            points.append({"time_days":round(t,8),"concentration":c}); t+=payload["step_days"]
-        peak=max(points,key=lambda p:p["concentration"])
-        result={"points":points,"peak":peak,"arrival_time_days":payload["distance_m"]/payload["velocity_m_day"],"model_version":payload["model_version"]}
+        snapshot=param_set_snapshot(self.connection, payload["parameter_set_id"])
+        effective=build_transport_input(payload, snapshot)
         with transaction(immediate=True) as connection:
-            cursor=connection.execute("INSERT INTO hydro_transport_runs(well_id,task_key,model_version,input_json,status,result_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",(well_id,key,payload["model_version"],json.dumps(payload,ensure_ascii=False),"done",json.dumps(result,ensure_ascii=False),now,now))
-            return dict(connection.execute("SELECT * FROM hydro_transport_runs WHERE id=?",(cursor.lastrowid,)).fetchone())
+            task, _ = insert_transport_run(connection, well_id, effective)
+            return task
