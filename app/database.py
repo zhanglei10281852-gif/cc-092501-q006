@@ -233,6 +233,14 @@ PERMISSIONS = [
     ("announcements.write", "维护公告", "announcements", "write"),
     ("audit.read", "查看审计", "audit", "read"),
     ("jobs.run", "执行后台任务", "jobs", "run"),
+    ("hydro.parameters.read", "查看地下水参数集版本", "hydro_parameters", "read"),
+    ("hydro.parameters.draft", "起草地下水参数集", "hydro_parameters", "draft"),
+    ("hydro.parameters.review", "复核地下水参数集", "hydro_parameters", "review"),
+    ("hydro.parameters.publish", "发布地下水参数集", "hydro_parameters", "publish"),
+    ("hydro.parameters.revoke", "撤销地下水参数集", "hydro_parameters", "revoke"),
+    ("hydro.sites.write", "维护井点与采样数据", "hydro_sites", "write"),
+    ("hydro.tasks.run", "执行反演与迁移计算", "hydro_tasks", "run"),
+    ("hydro.results.read", "查看计算结果与差异", "hydro_results", "read"),
 ]
 
 
